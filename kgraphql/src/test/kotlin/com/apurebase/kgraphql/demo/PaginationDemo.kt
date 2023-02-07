@@ -27,6 +27,9 @@ data class Person<T>(
 
 fun main() {
     val schema = KGraphQL.schema {
+        configure {
+            this.useDefaultPrettyPrinter = true
+        }
         query("names") {
             resolver { ->
                 Connection(
@@ -63,6 +66,7 @@ fun main() {
         }
     }
 
-    println(schema.types.map { it.name })
+    schema.types.forEach { println(it.name) }
+    println()
     println(schema.executeBlocking("{ names { totalCount, edges { node, cursor }, pageInfo { endCursor, hasNextPage } } }"))
 }
