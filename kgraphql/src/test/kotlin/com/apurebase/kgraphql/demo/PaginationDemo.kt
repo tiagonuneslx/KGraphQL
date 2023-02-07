@@ -21,10 +21,6 @@ class Connection<T : Any, K : Any>(
 
 val names = listOf("Kai", "Eliana", "Jayden", "Ezra", "Luca", "Rowan", "Nova", "Amara")
 
-data class Person<T>(
-    val id: T
-)
-
 fun main() {
     val schema = KGraphQL.schema {
         configure {
@@ -46,23 +42,6 @@ fun main() {
                     )
                 )
             }.returns<Connection<String, Int>>()
-        }
-        query("people") {
-            resolver { ->
-                Connection(
-                    totalCount = names.size,
-                    edges = names.subList(0, 2).mapIndexed { index, name ->
-                        Connection.Edge(
-                            node = Person(name),
-                            cursor = index
-                        )
-                    },
-                    pageInfo = Connection.PageInfo(
-                        endCursor = 1,
-                        hasNextPage = true
-                    )
-                )
-            }.returns<Connection<Person<String>, Int>>()
         }
     }
 
