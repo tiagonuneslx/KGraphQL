@@ -23,11 +23,11 @@ import com.apurebase.kgraphql.schema.model.QueryDef
 import com.apurebase.kgraphql.schema.model.SchemaDefinition
 import com.apurebase.kgraphql.schema.model.Transformation
 import com.apurebase.kgraphql.schema.model.TypeDef
-import kotlin.reflect.KClass
-import kotlin.reflect.KProperty1
-import kotlin.reflect.KType
-import kotlin.reflect.KVisibility
+import java.lang.reflect.ParameterizedType
+import java.lang.reflect.TypeVariable
+import kotlin.reflect.*
 import kotlin.reflect.full.*
+import kotlin.reflect.jvm.javaType
 import kotlin.reflect.jvm.jvmErasure
 
 @Suppress("UNCHECKED_CAST")
@@ -165,8 +165,10 @@ class SchemaCompilation(
             kType.jvmErasure == Context::class && typeCategory == TypeCategory.INPUT -> contextType
             kType.jvmErasure == Execution.Node::class && typeCategory == TypeCategory.INPUT -> executionType
             kType.jvmErasure == Context::class && typeCategory == TypeCategory.QUERY -> throw SchemaException("Context type cannot be part of schema")
-            kType.arguments.isNotEmpty() -> configuration.genericTypeResolver.resolveMonad(kType)
-                .let { handlePossiblyWrappedType(it, typeCategory) }
+            kType.arguments.isNotEmpty() ->
+                handleGenericsType(kType.javaType)
+//            kType.arguments.isNotEmpty() -> configuration.genericTypeResolver.resolveMonad(kType)
+//                .let { handlePossiblyWrappedType(it, typeCategory) }
             kType.jvmErasure.isSealed -> TypeDef.Union(
                 name = kType.jvmErasure.simpleName!!,
                 members = kType.jvmErasure.sealedSubclasses.toSet(),
@@ -182,20 +184,148 @@ class SchemaCompilation(
         }
     }
 
-    private suspend fun handleCollectionType(kType: KType, typeCategory: TypeCategory): Type {
-        val type = when {
-            kType.getIterableElementType() != null -> kType.getIterableElementType()
-            kType.arguments.size == 1 -> kType.arguments.first().type
-            else -> null
-        } ?: throw throw SchemaException("Cannot handle collection without element type")
+    private suspend fun handlePossiblyWrappedType(jType: java.lang.reflect.Type, typeCategory: TypeCategory) : Type = try {
+        when {
+            Iterable::class.java.isAssignableFrom(jType.rawType) -> handleCollectionType(jType, typeCategory)
+//            kType.jvmErasure == Context::class && typeCategory == TypeCategory.INPUT -> contextType
+//            kType.jvmErasure == Execution.Node::class && typeCategory == TypeCategory.INPUT -> executionType
+//            kType.jvmErasure == Context::class && typeCategory == TypeCategory.QUERY -> throw SchemaException("Context type cannot be part of schema")
+            jType is ParameterizedType -> handleGenericsType(jType)
+//            kType.arguments.isNotEmpty() -> configuration.genericTypeResolver.resolveMonad(kType)
+//                .let { handlePossiblyWrappedType(it, typeCategory) }
+//            kType.jvmErasure.isSealed -> TypeDef.Union(
+//                name = kType.jvmErasure.simpleName!!,
+//                members = kType.jvmErasure.sealedSubclasses.toSet(),
+//                description = null
+//            ).let { handleUnionType(it) }
+            else -> handleSimpleType(jType, typeCategory)
+        }
+    } catch (e: Throwable) {
+        if ("KotlinReflectionInternalError" in e.toString()) {
+            throw SchemaException("If you construct a query/mutation generically, you must specify the return type T explicitly with resolver{ ... }.returns<T>()")
+        } else {
+            throw e
+        }
+    }
 
+    private suspend fun handleGenericsType(jType: java.lang.reflect.Type): Type {
+
+        // Copied from Moshi KotlinJsonAdapter
+
+        val rawType = jType.rawType
+//        assertValidGenericType(rawType, jType)
+        val rawTypeKotlin = rawType.kotlin
+//        assertValidGenericType(rawTypeKotlin, jType)
+
+        println("handleGenericsType   type: $jType")
+        println("handleGenericsType   rawType: $rawType")
+
+        // Copied from handleObjectType
+
+        // TODO: Let's not worry about superclasses for now
+//        val objectDefs = definition.objects.filter { it.kClass.isSuperclassOf(rawTypeKotlin) }
+//        val objectDef = objectDefs.find { it.jType == type } ?: TypeDef.Object(rawTypeKotlin.defaultKQLTypeName(), rawTypeKotlin, type)
+        val objectDefs = emptyList<TypeDef.Object<*>>()
+        val objectDef = TypeDef.Object(jType.typeName.replace("""(\w|\.)+""".toRegex()) { it.value.substringAfterLast(".") }.replace("""(\w)+\$""".toRegex(), ""), rawTypeKotlin)
+
+        //treat introspection types as objects -> adhere to reference implementation behaviour
+        val kind = if(rawTypeKotlin.isFinal || objectDef.name.startsWith("__")) TypeKind.OBJECT else TypeKind.INTERFACE
+
+        val objectType = if(kind == TypeKind.OBJECT) Type.Object(objectDef) else Type.Interface(objectDef)
+
+        // TODO: Let's not worry about differentiating between KClass<*> with different generics
+        val typeProxy = TypeProxy(objectType)
+        queryTypeProxies[rawTypeKotlin] = typeProxy
+
+        val allKotlinProperties = objectDefs.fold(emptyMap<String, PropertyDef.Kotlin<*, *>>()) { acc, def ->
+            acc + def.kotlinProperties.mapKeys { (property) -> property.name }
+        }
+        val allTransformations= objectDefs.fold(emptyMap<String, Transformation<*, *>>()) { acc, def ->
+            acc + def.transformations.mapKeys { (property) -> property.name }
+        }
+
+        val kotlinFields = rawTypeKotlin.memberProperties
+            .filter { field -> field.visibility == KVisibility.PUBLIC }
+            .filterNot { field -> objectDefs.any { it.isIgnored(field.name) } }
+            .map { property ->
+                val resolvedPropertyType =
+                    if (property.returnType.javaType is ParameterizedType || property.returnType.javaType is TypeVariable<*>) {
+                        resolve(
+                            jType,
+                            rawType,
+                            property.returnType.javaType
+                        ).also {
+                            println("handleGenericsType   resolvedPropertyType: $it")
+                        }
+                    } else {
+                        null
+                    }
+                handleKotlinProperty(
+                    kProperty = property,
+                    kqlProperty = allKotlinProperties[property.name],
+                    transformation = allTransformations[property.name],
+                    resolvedPropertyType = resolvedPropertyType
+                )
+            }
+
+        val extensionFields = objectDefs
+            .flatMap(TypeDef.Object<*>::extensionProperties)
+            .map { property -> handleOperation(property) }
+
+        val dataloadExtensionFields = objectDefs
+            .flatMap(TypeDef.Object<*>::dataloadExtensionProperties)
+            .map { property -> handleDataloadOperation(property) }
+
+        val unionFields = objectDefs
+            .flatMap(TypeDef.Object<*>::unionProperties)
+            .map { property -> handleUnionProperty(property) }
+
+        val typenameResolver: suspend (Any) -> String? = { value: Any ->
+            schemaProxy.typeByKClass(value.javaClass.kotlin)?.name ?: typeProxy.name
+        }
+
+        val __typenameField = handleOperation (
+            PropertyDef.Function<Nothing, String?> ("__typename", FunctionWrapper.on(typenameResolver, true))
+        )
+
+        val declaredFields = kotlinFields + extensionFields + unionFields + dataloadExtensionFields
+
+        if(declaredFields.isEmpty()){
+            throw SchemaException("An Object type must define one or more fields. Found none on type ${objectDef.name}")
+        }
+
+        declaredFields.find { it.name.startsWith("__") }?.let { field ->
+            throw SchemaException("Illegal name '${field.name}'. Names starting with '__' are reserved for introspection system")
+        }
+
+        val allFields = declaredFields + __typenameField
+        typeProxy.proxied = if(kind == TypeKind.OBJECT) Type.Object(objectDef, allFields) else Type.Interface(objectDef, allFields)
+        return typeProxy
+    }
+
+    private suspend fun handleCollectionType(kType: KType, typeCategory: TypeCategory): Type {
+        val type = kType.getIterableElementType()
         val nullableListType = Type.AList(handleSimpleType(type, typeCategory))
         return applyNullability(kType, nullableListType)
+    }
+
+    private suspend fun handleCollectionType(jType: java.lang.reflect.Type, typeCategory: TypeCategory): Type {
+        if(jType !is ParameterizedType) throw SchemaException("Cannot handle collection without element type")
+        val type = jType.actualTypeArguments.first()
+        val nullableListType = Type.AList(handleSimpleType(type, typeCategory))
+        // TODO: Apply nullability to simple type
+        return Type.NonNull(nullableListType)
     }
 
     private suspend fun handleSimpleType(kType: KType, typeCategory: TypeCategory): Type {
         val simpleType = handleRawType(kType.jvmErasure, typeCategory)
         return applyNullability(kType, simpleType)
+    }
+
+    private suspend fun handleSimpleType(jType: java.lang.reflect.Type, typeCategory: TypeCategory): Type {
+        val simpleType = handleRawType(jType, typeCategory)
+        // TODO: Apply nullability to simple type
+        return Type.NonNull(simpleType)
     }
 
     private fun applyNullability(kType: KType, simpleType: Type): Type {
@@ -225,6 +355,38 @@ class SchemaCompilation(
             ?: scalars[kClass]
             ?: when(typeCategory) {
                 TypeCategory.QUERY -> handleObjectType(kClass)
+                TypeCategory.INPUT -> handleInputType(kClass)
+            }
+    }
+
+    private suspend fun handleRawType(jType: java.lang.reflect.Type, typeCategory: TypeCategory) : Type {
+        // TODO: Let's not worry about Unions for now
+//        when (val type = unions.find { it.name == kClass.simpleName }) {
+//            null -> Unit
+//            else -> return type
+//        }
+
+        val kClass = jType.rawType.kotlin
+
+        if(kClass == Context::class) throw SchemaException("Context type cannot be part of schema")
+
+        val cachedInstances = when(typeCategory) {
+            TypeCategory.QUERY -> queryTypeProxies
+            TypeCategory.INPUT -> inputTypeProxies
+        }
+
+
+        return cachedInstances[kClass]
+            ?: enums[kClass]
+            ?: scalars[kClass]
+            ?: when(typeCategory) {
+                TypeCategory.QUERY -> {
+                    if(jType is ParameterizedType) {
+                        handleGenericsType(jType)
+                    } else {
+                        handleObjectType(kClass)
+                    }
+                }
                 TypeCategory.INPUT -> handleInputType(kClass)
             }
     }
@@ -369,9 +531,15 @@ class SchemaCompilation(
     private suspend fun <T : Any, R> handleKotlinProperty (
             kProperty: KProperty1<T, R>,
             kqlProperty: PropertyDef.Kotlin<*, *>?,
-            transformation: Transformation<*, *>?
+            transformation: Transformation<*, *>?,
+            resolvedPropertyType: java.lang.reflect.Type? = null
     ) : Field.Kotlin<*, *> {
-        val returnType = handlePossiblyWrappedType(kProperty.returnType, TypeCategory.QUERY)
+        val returnType = if (resolvedPropertyType == null) {
+            handlePossiblyWrappedType(kProperty.returnType, TypeCategory.QUERY)
+        } else {
+            handlePossiblyWrappedType(resolvedPropertyType, TypeCategory.QUERY)
+        }
+
         val inputValues = if(transformation != null){
             handleInputValues("$kProperty transformation", transformation.transformation, emptyList())
         } else {

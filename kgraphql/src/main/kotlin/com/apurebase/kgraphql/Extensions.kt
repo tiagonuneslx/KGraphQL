@@ -25,7 +25,7 @@ internal fun KClass<*>.isIterable() = isSubclassOf(Iterable::class)
 
 internal fun KType.isIterable() = jvmErasure.isIterable() || toString().startsWith("kotlin.Array")
 
-internal fun KType.getIterableElementType(): KType? {
+internal fun KType.getIterableElementType(): KType {
     require(isIterable()) { "KType $this is not collection type" }
     return arguments.firstOrNull()?.type ?: throw NoSuchElementException("KType $this has no type arguments")
 }

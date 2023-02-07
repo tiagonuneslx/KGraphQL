@@ -88,3 +88,18 @@ fun assertValidObjectType(kClass: KClass<*>) = when {
     kClass.isSubclassOf(Enum::class) -> throw SchemaException("Cannot handle enum class $kClass as Object type")
     else -> Unit
 }
+
+fun assertValidGenericType(rawType: Class<*>, type: java.lang.reflect.Type) {
+    if (rawType.isInterface) throw SchemaException("Cannot handle interface $type as Generic Object type")
+    if (rawType.isEnum) throw SchemaException("Cannot handle enum class $type as Generic Object type")
+    if (!rawType.isAnnotationPresent(KOTLIN_METADATA)) throw SchemaException("Cannot handle Java class $type as Generic Object type")
+    if (isPlatformType(rawType)) throw SchemaException("Cannot handle builtin class $type as Generic Object type")
+    if (rawType.isLocalClass) throw SchemaException("Cannot handle local class or object $type as Generic Object type")
+}
+
+fun <T: Any> assertValidGenericType(rawTypeKotlin: KClass<T>, type: java.lang.reflect.Type) {
+    if(rawTypeKotlin.isAbstract) throw SchemaException("Cannot handle abstract class $type as Generic Object type")
+    if(rawTypeKotlin.isInner) throw SchemaException("Cannot handle inner class $type as Generic Object type")
+    if(rawTypeKotlin.objectInstance != null) throw SchemaException("Cannot handle object declaration $type as Generic Object type")
+    if(rawTypeKotlin.isSealed) throw SchemaException("Cannot handle sealed class $type as Generic Object type")
+}
